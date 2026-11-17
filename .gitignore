@@ -1,0 +1,14 @@
+docs/tasks/20261116-bilibili-episode-download/downloads/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+data/
+.DS_Store
+video_study/config.py
+video_study/videos/
+video_study/*.sqlite3
+video_study/*.sqlite3-*
+*.log
+*.egg-info/
+docs/screenshots/import.png
