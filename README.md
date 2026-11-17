@@ -2,7 +2,7 @@
 
 一个在本机运行的 Gradio 视频学习工具：管理自己的视频，结合带时间戳的字幕逐句循环播放，并记录提问和笔记。
 
-![学习详情示例](docs/screenshots/study-detail.png)
+![学习详情示例](study-detail.png)
 
 ## 能做什么
 
@@ -47,11 +47,11 @@ python video_study/app.py
 
 ## 合集导入
 
-1. 在 Tampermonkey 中安装 [`bilibili-episode-export.user.js`](video_study/bilibili-episode-export.user.js)。脚本在 B 站番剧、视频、合集等常见页面尝试导出 JSON 清单。
+1. 在 Tampermonkey 中安装 [`bilibili-episode-export.user.js`](bilibili-episode-export.user.js)。脚本在 B 站番剧、视频、合集等常见页面尝试导出 JSON 清单。
 2. 在“下载与导入”上传 JSON，按需选择 Chrome 或 Edge 登录状态和清晰度，再开始下载。
 3. 清单标记为非全量时，先检查内容，再勾选“允许非全量清单”。单个视频也可直接输入链接；当前下载器接受 `www.bilibili.com/video/BV...` 和 `www.bilibili.com/bangumi/play/ep...`，以及视频分 P 参数 `p`。
 
-![下载与导入页面](docs/screenshots/download-import.png)
+![下载与导入页面](download-import.png)
 
 导出脚本覆盖的页面类型比下载器直接输入链接更广；其他合集应先导出清单，再由下载器逐条处理。会员或付费内容仍受账号实际权限和 B 站规则限制。
 
@@ -66,4 +66,4 @@ python -m compileall -q video_study
 node --check video_study/player.js
 ```
 
-发布前请检查 `git status --short` 和 `git ls-files`，确认没有视频、数据库、凭证或私人文件。示例截图使用合成内容，见 [`docs/screenshots/`](docs/screenshots/)。
+发布前请检查 `git status --short` 和 `git ls-files`，确认没有视频、数据库、凭证或私人文件。

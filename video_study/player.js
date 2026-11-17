@@ -99,8 +99,7 @@
     });
     const show = () => {
       status.textContent = repeat.checked && index >= 0 && index < segments.length
-        ? `${index + 1}/${segments.length} · 第 ${played + 1}/${count.value} 遍 · ${segments[index].text}`
-        : repeat.checked ? '逐句模式已开启' : '';
+        ? `${index + 1}/${segments.length} · 第 ${played + 1}/${count.value} 遍 · ${segments[index].text}` :'';
     };
     const next = () => {
       clearWait();
