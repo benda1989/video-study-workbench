@@ -15,4 +15,10 @@
 ## 第 3 轮：同步到现有 GitHub 仓库
 - 用户提供 `benda1989/video-study-workbench` 克隆目录；已确认远端 `origin/main` 及原有 Apache-2.0 许可证。
 - 通过白名单同步源码、文档、截图和配置样例；本机 `config.py`、视频及 SQLite 未复制。
-- 待完成：提交前审查、提交和推送后远端核对。
+- 提交前审查通过：暂存清单无视频、SQLite、`config.py` 或真实清单截图；`git diff --cached --check` 通过。
+- 提交 `7a70013` 已推送到 `origin/main`，`git ls-remote` 与本地 HEAD 哈希一致；GitHub 页面显示 README、合成截图与 Apache-2.0。
+- GitHub About 已设置新描述和 12 个 Topics，页面及刷新后的 GitHub API 均确认。
+- 克隆仓库用配置样例空库启动，HTTP 200；Python 编译、`node --check` 通过。
+- 代码复审：通过；验收审核：通过。无待修复项。
+
+残余风险：未在全新环境下载并安装全部依赖；本轮使用已安装 Gradio 6.9.0 的 Python 3.12 验证。字幕和 AI 外部服务未配置，不属于本次发布验收。
