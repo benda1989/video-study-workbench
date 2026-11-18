@@ -1,9 +1,6 @@
-from __future__ import annotations
-
 import html
 import json
 import math
-import os
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
@@ -11,7 +8,7 @@ from urllib.parse import quote
 import gradio as gr
 
 from ai import AIClient
-from config import GRADIO_AUTH_PASSWORD, GRADIO_AUTH_USER, PROMPTS
+from config import GRADIO_AUTH_PASSWORD, GRADIO_AUTH_USER, PROMPTS,SERVER,SERVER_PORT
 from downloader import DownloadManager, import_video, parse_targets
 from storage import Store
 from subtitles import Transcriber
@@ -526,7 +523,7 @@ def build_app():
 
 
 def main():
-    launch_kwargs = dict(server_name="127.0.0.1", server_port=int(os.getenv("VIDEO_STUDY_PORT", "7863")),
+    launch_kwargs = dict(server_name=SERVER, server_port=SERVER_PORT,
                          allowed_paths=[str(store.media_dir)], auth=configured_auth())
     if GRADIO_6:
         player_script = Path(__file__).with_name("player.js").read_text(encoding="utf-8")

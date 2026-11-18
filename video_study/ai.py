@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import httpx
 
 from config import AI_API_KEY, AI_API_MODE, AI_BASE_URL, AI_MODEL, PROMPTS
@@ -41,15 +39,13 @@ class AIClient:
         messages = [{"role": "user", "content": context}]
         messages.extend({"role": item["role"], "content": item["content"]} for item in history[-12:] if item.get("role") in {"user", "assistant"})
         messages.append({"role": "user", "content": prompt})
-        mode = AI_API_MODE or "responses"
-        if mode == "responses":
+        if AI_API_MODE == "responses":
             endpoint = "responses"
             payload = {"model": AI_MODEL, "instructions": system, "input": messages}
-        elif mode == "chat_completions":
+        else:
             endpoint = "chat/completions"
             payload = {"model": AI_MODEL, "messages": [{"role": "system", "content": system}, *messages], "temperature": 0.4}
-        else:
-            raise ValueError("不支持的 AI_API_MODE")
+
         headers = {"Authorization": f"Bearer {AI_API_KEY}"} if AI_API_KEY else {}
         try:
             with httpx.Client(timeout=60) as client:
@@ -60,7 +56,7 @@ class AIClient:
             raise RuntimeError(f"AI 请求失败：{error}") from error
         if not isinstance(data, dict):
             raise RuntimeError("AI 响应格式不正确")
-        if mode == "responses":
+        if  AI_API_MODE == "responses":
             return response_text(data)
         try:
             answer = data["choices"][0]["message"]["content"].strip()

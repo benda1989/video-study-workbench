@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -80,6 +78,7 @@ class Store:
             if "display_name" not in {row[1] for row in db.execute("PRAGMA table_info(downloads)")}:
                 db.execute("ALTER TABLE downloads ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE downloads SET state = 'interrupted', detail = '应用重启，任务已中断', updated_at = ? WHERE state IN ('queued', 'running')", (now(),))
+            self.migrate_media_paths(db)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -97,8 +96,31 @@ class Store:
         finally:
             db.close()
 
+    def migrate_media_paths(self, db: sqlite3.Connection) -> None:
+        rows = db.execute("SELECT id,file_path,size_bytes FROM videos").fetchall()
+        occupied = {row["file_path"] for row in rows}
+        for row in rows:
+            old_path = Path(row["file_path"])
+            if not old_path.is_absolute():
+                continue
+            candidate = self.media_dir / old_path.name
+            if not candidate.resolve().is_relative_to(self.media_dir) or not candidate.is_file() or candidate.stat().st_size != row["size_bytes"]:
+                continue
+            relative_path = candidate.relative_to(self.data_dir).as_posix()
+            if relative_path in occupied:
+                continue
+            db.execute("UPDATE videos SET file_path=? WHERE id=?", (relative_path, row["id"]))
+            occupied.add(relative_path)
+
+    def video_row(self, row: sqlite3.Row) -> dict:
+        video = dict(row)
+        path = Path(video["file_path"])
+        if not path.is_absolute():
+            video["file_path"] = str(self.managed_path(path))
+        return video
+
     def managed_path(self, path: Path) -> Path:
-        resolved = path.resolve()
+        resolved = (path if path.is_absolute() else self.data_dir / path).resolve()
         if not resolved.is_relative_to(self.media_dir):
             raise ValueError("文件不在受管视频目录中")
         return resolved
@@ -107,12 +129,13 @@ class Store:
         path = self.managed_path(path)
         if not path.is_file() or duration <= 0:
             raise ValueError("视频文件无效")
+        relative_path = path.relative_to(self.data_dir).as_posix()
         with self.connect() as db:
             db.execute(
                 "INSERT OR IGNORE INTO videos(source_url,title,file_path,duration,size_bytes,added_at) VALUES(?,?,?,?,?,?)",
-                (source_url, title[:300], str(path), duration, path.stat().st_size, now()),
+                (source_url, title[:300], relative_path, duration, path.stat().st_size, now()),
             )
-            return int(db.execute("SELECT id FROM videos WHERE file_path = ?", (str(path),)).fetchone()[0])
+            return int(db.execute("SELECT id FROM videos WHERE file_path = ?", (relative_path,)).fetchone()[0])
 
     def list_videos(self, page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
         page = max(1, page)
@@ -120,17 +143,17 @@ class Store:
         with self.connect() as db:
             total = int(db.execute("SELECT COUNT(*) FROM videos").fetchone()[0])
             rows = db.execute("SELECT * FROM videos ORDER BY id DESC LIMIT ? OFFSET ?", (page_size, (page - 1) * page_size)).fetchall()
-            return [dict(row) for row in rows], total
+            return [self.video_row(row) for row in rows], total
 
     def get_video(self, video_id: int) -> dict | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
-            return dict(row) if row else None
+            return self.video_row(row) if row else None
 
     def video_for_source(self, source_url: str) -> dict | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM videos WHERE source_url = ? ORDER BY id DESC LIMIT 1", (source_url,)).fetchone()
-            return dict(row) if row else None
+            return self.video_row(row) if row else None
 
     def update_video_title(self, video_id: int, old_title: str, new_title: str) -> bool:
         title = new_title.strip()[:300]
