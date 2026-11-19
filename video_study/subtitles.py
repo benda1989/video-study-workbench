@@ -21,18 +21,20 @@ def parse_segments(payload: Any) -> list[dict]:
             continue
         start = item.get("start", item.get("start_time"))
         end = item.get("end", item.get("end_time"))
-        if start is None and "start_ms" in item:
-            start = float(item["start_ms"]) / 1000
-        if end is None and "end_ms" in item:
-            end = float(item["end_ms"]) / 1000
         try:
-            start, end = float(start), float(end)
+            if start is None and "start_ms" in item:
+                start = float(item["start_ms"]) / 1000
+            if end is None and "end_ms" in item:
+                end = float(item["end_ms"]) / 1000
+            start, end = float(start), float(end)+500
+            cut = min(1000,(end-start)/100)
         except (TypeError, ValueError):
             continue
         text = str(item.get("text") or item.get("content") or "").strip()
         if not text or not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             continue
         segments.append({"start": start, "end": end, "text": text, "speaker": str(item.get("speaker") or "")})
+    segments[-1]["end"]+=500
     segments.sort(key=lambda segment: (segment["start"], segment["end"]))
     return segments
 

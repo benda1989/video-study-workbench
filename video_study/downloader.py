@@ -177,7 +177,7 @@ class DownloadManager:
             path = next((p for p in self.store.media_dir.glob(f"{target.key}.*") if p.suffix.lower() in {".mp4", ".mkv", ".webm"}), None)
         if path is None:
             raise ValueError("下载命令完成但未找到媒体文件")
-        return self.store.add_video(path, format_video_title(metadata, target.url, target.title or target.key), target.url, probe_media(path))
+        return self.store.add_video(path, format_video_title(metadata, target.url, target.title or target.key), target.url, probe_media(path), metadata=metadata)
 
 
 def import_video(store: Store, uploaded_path: str) -> int:

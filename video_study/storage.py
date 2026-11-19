@@ -1,4 +1,6 @@
 import sqlite3
+import json
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -78,6 +80,20 @@ class Store:
             if "display_name" not in {row[1] for row in db.execute("PRAGMA table_info(downloads)")}:
                 db.execute("ALTER TABLE downloads ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE downloads SET state = 'interrupted', detail = '应用重启，任务已中断', updated_at = ? WHERE state IN ('queued', 'running')", (now(),))
+            columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
+            for name, declaration in {
+                "series_name": "TEXT NOT NULL DEFAULT ''", "season_number": "INTEGER NOT NULL DEFAULT 1",
+                "episode_number": "INTEGER NOT NULL DEFAULT 0", "position": "REAL NOT NULL DEFAULT 0",
+                "watched_at": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE videos ADD COLUMN {name} {declaration}")
+            db.execute("""CREATE TABLE IF NOT EXISTS vocabulary (
+                video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                target TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
+                items TEXT NOT NULL DEFAULT '[]', detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(video_id, target))""")
+            db.execute("UPDATE vocabulary SET state='failed',detail='应用重启，生成已中断，请重试' WHERE state='running'")
             self.migrate_media_paths(db)
 
     @contextmanager
@@ -125,7 +141,7 @@ class Store:
             raise ValueError("文件不在受管视频目录中")
         return resolved
 
-    def add_video(self, path: Path, title: str, source_url: str, duration: float) -> int:
+    def add_video(self, path: Path, title: str, source_url: str, duration: float, metadata: dict | None = None) -> int:
         path = self.managed_path(path)
         if not path.is_file() or duration <= 0:
             raise ValueError("视频文件无效")
@@ -135,7 +151,17 @@ class Store:
                 "INSERT OR IGNORE INTO videos(source_url,title,file_path,duration,size_bytes,added_at) VALUES(?,?,?,?,?,?)",
                 (source_url, title[:300], relative_path, duration, path.stat().st_size, now()),
             )
-            return int(db.execute("SELECT id FROM videos WHERE file_path = ?", (relative_path,)).fetchone()[0])
+            video_id = int(db.execute("SELECT id FROM videos WHERE file_path = ?", (relative_path,)).fetchone()[0])
+            if metadata and metadata.get("series") and str(metadata.get("episode_number", "")).isdigit():
+                # Metadata is authoritative; strip a matching season suffix from series.
+                from library import episode_info
+                inferred = episode_info({"title": title})
+                name = inferred[0] if inferred else str(metadata["series"])
+                season = metadata.get("season_number")
+                season = int(season) if str(season).isdigit() else inferred[1] if inferred else 1
+                db.execute("UPDATE videos SET series_name=?,season_number=?,episode_number=? WHERE id=?",
+                           (name, season, int(metadata["episode_number"]), video_id))
+            return video_id
 
     def list_videos(self, page: int = 1, page_size: int = 10) -> tuple[list[dict], int]:
         page = max(1, page)
@@ -265,3 +291,40 @@ class Store:
         with self.connect() as db:
             return [{"role": row["role"], "content": row["content"]}
                     for row in db.execute("SELECT role,content FROM chat_messages WHERE video_id=? ORDER BY id", (video_id,))]
+
+
+    def all_videos(self) -> list[dict]:
+        with self.connect() as db:
+            return [self.video_row(row) for row in db.execute("SELECT * FROM videos ORDER BY id DESC")]
+
+    def setting(self, key: str, default: str = "") -> str:
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as db:
+            db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def save_position(self, video_id: int | None, position: float) -> None:
+        if not video_id or not isinstance(position, (int, float)) or not math.isfinite(position) or position < 0:
+            return
+        with self.connect() as db:
+            db.execute("UPDATE videos SET position=MIN(?,duration),watched_at=? WHERE id=?", (position, now(), video_id))
+
+    def vocabulary(self, video_id: int, target: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM vocabulary WHERE video_id=? AND target=?", (video_id, target)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result['items'] = json.loads(result['items'])
+        return result
+
+    def save_vocabulary(self, video_id: int, target: str, fingerprint: str, state: str,
+                        items: list[dict], detail: str = "") -> None:
+        with self.connect() as db:
+            db.execute("""INSERT INTO vocabulary(video_id,target,fingerprint,state,items,detail) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(video_id,target) DO UPDATE SET fingerprint=excluded.fingerprint,
+                state=excluded.state,items=excluded.items,detail=excluded.detail""",
+                       (video_id, target, fingerprint, state, json.dumps(items, ensure_ascii=False), detail[:500]))

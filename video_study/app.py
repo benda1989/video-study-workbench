@@ -1,6 +1,5 @@
 import html
 import json
-import math
 from pathlib import Path
 from threading import Lock
 from urllib.parse import quote
@@ -8,6 +7,8 @@ from urllib.parse import quote
 import gradio as gr
 
 from ai import AIClient
+from library import group_videos
+from vocabulary import TARGETS, VocabularyService, fingerprint
 from config import GRADIO_AUTH_PASSWORD, GRADIO_AUTH_USER, PROMPTS,SERVER,SERVER_PORT
 from downloader import DownloadManager, import_video, parse_targets
 from storage import Store
@@ -17,6 +18,7 @@ store = Store()
 downloads = DownloadManager(store)
 transcriber = Transcriber()
 ai = AIClient()
+vocabulary_service = VocabularyService(store, ai)
 subtitle_lock = Lock()
 GRADIO_6 = int(gr.__version__.split(".")[0]) >= 6
 
@@ -36,44 +38,42 @@ def configured_auth() -> tuple[str, str] | None:
     return username, password
 
 
-PAGE_SIZE = 10
-MAX_PAGE_SIZE = 80
-PAGE_SIZES = {10, 20, 40, 80}
-LIBRARY_OUTPUT_COUNT = 2 + MAX_PAGE_SIZE * 4
+LIBRARY_OUTPUT_COUNT = 2
 
 
-def library(page: int = 1, page_size: int = PAGE_SIZE):
-    try:
-        page_size = int(page_size)
-        page = int(page)
-    except (TypeError, ValueError):
-        page_size, page = PAGE_SIZE, 1
-    if page_size not in PAGE_SIZES:
-        page_size = PAGE_SIZE
-    rows, total = store.list_videos(page, page_size)
-    pages = max(1, math.ceil(total / page_size))
-    page = min(max(1, page), pages)
-    if not rows and total:
-        rows, _ = store.list_videos(page, page_size)
-    updates = [page, f"{page}/{pages} 页 · 共{total}条 · 每页"]
-    for index in range(MAX_PAGE_SIZE):
-        if index < len(rows):
-            row = rows[index]
-            duration = f"{row['duration']/60:.1f} 分钟" if row["duration"] >= 60 else f"{row['duration']:.1f} 秒"
-            info = f"{duration} · {row['size_bytes']/1048576:.1f} MB · 字幕 {row['subtitle_state']}"
-            updates.extend((gr.update(visible=True), gr.update(value=row["title"]), gr.update(value=info), row["id"]))
-        else:
-            updates.extend((gr.update(visible=False), gr.update(value=""), gr.update(value=""), None))
-    return tuple(updates)
+def library():
+    groups = group_videos(store.all_videos())
+    total = sum(len(group['videos']) for group in groups)
+    return f"共{len(groups)}项 · {total}个视频", groups
 
 
-def initial_library(page: int, page_size: int):
-    result = library(page, page_size)
-    return gr.update(value=page_size if page_size in PAGE_SIZES else PAGE_SIZE), *result
+def refresh_library(existing):
+    count, groups = library()
+    # Playback progress does not change the hierarchy. Avoid tearing down live
+    # dynamic controls merely because a video has been watched since last visit.
+    def structure(rows):
+        return [(group['key'], [{k: v for k, v in video.items() if k not in {'position', 'watched_at'}}
+                                for video in group['videos']]) for group in rows]
+    return count, gr.update() if structure(existing or []) == structure(groups) else groups
 
 
-def change_page_size(page_size: int):
-    return page_size, *library(1, page_size)
+def latest_series_video(group_key):
+    group = next((g for g in group_videos(store.all_videos()) if g['key'] == group_key), None)
+    return next((v for v in group['videos'] if v['id'] == group['resume']), None) if group else None
+
+
+def continue_label(title, video):
+    return f"{title} · 继续播放 第{video['season']}季 第{video['episode']}集 · {video.get('position', 0)/60:.1f}分"
+
+
+def continue_series(group_key):
+    video = latest_series_video(group_key)
+    return choose_video(video['id'] if video else None)
+
+
+def refresh_continue(group_key, title):
+    video = latest_series_video(group_key)
+    return gr.update(value=continue_label(title, video)) if video else gr.update()
 
 
 def download(url, manifest, allow_partial, browser, quality):
@@ -86,14 +86,14 @@ def download(url, manifest, allow_partial, browser, quality):
         return message(error), jobs()
 
 
-def upload_video(file, page_size=PAGE_SIZE):
+def upload_video(file):
     if not file:
-        return "请选择视频文件", *library(1, page_size)
+        return "请选择视频文件", *library()
     try:
         video_id = import_video(store, file)
-        return f"已导入视频 #{video_id}", *library(1, page_size)
+        return f"已导入视频 #{video_id}", *library()
     except (OSError, ValueError) as error:
-        return message(error), *library(1, page_size)
+        return message(error), *library()
 
 
 def jobs():
@@ -116,11 +116,11 @@ def jobs():
     return '<div class="job-list">' + ''.join(items) + '</div>'
 
 
-def monitor(page, known_done, prompted_auth, page_size=PAGE_SIZE):
+def monitor(known_done, prompted_auth):
     active = store.list_downloads()
     table = jobs()
     done_signature = json.dumps([(row["id"], row["done_count"]) for row in active if row["done_count"]], separators=(",", ":"))
-    library_result = library(page, page_size) if done_signature != known_done else (gr.update(),) * LIBRARY_OUTPUT_COUNT
+    library_result = library() if done_signature != known_done else (gr.update(),) * LIBRARY_OUTPUT_COUNT
     new_auth = next((row for row in active if row["state"] == "auth_required" and row["id"] > prompted_auth), None)
     if new_auth:
         auth_update = gr.update(visible=True)
@@ -164,8 +164,10 @@ def player(video_id: int | None) -> str:
     src = "/gradio_api/file=" + quote(video["file_path"], safe="/")
     data = html.escape(json.dumps(segments, ensure_ascii=False), quote=True)
     buttons = "".join(f'<button type="button" data-seek="{i}" title="跳转到本句"><span>{i+1:02d}</span> {html.escape(s["text"])}</button>' for i, s in enumerate(segments))
-    return f'''<section id="study-player" data-video-id="{video_id}" data-segments="{data}">
-      <div class="video-frame"><video controls playsinline preload="metadata" src="{src}"></video></div>
+    return f'''<section id="study-player" data-video-id="{video_id}" data-segments="{data}" data-resume="{video.get('position', 0)}">
+      <div class="video-frame"><video controls playsinline preload="metadata" src="{src}"></video>
+        <div class="vocab-current" aria-live="polite" hidden></div>
+      </div>
       <details class="player-settings" open>
         <summary>播放设置<span class="settings-toggle-hint" aria-hidden="true"></span></summary>
       <div class="study-controls">
@@ -178,7 +180,7 @@ def player(video_id: int | None) -> str:
         <label title="少于此词数才向后并句，累计达到后停止；不保证每组都能达到"><input class="merge-min-words" type="number" min="1" max="100" step="1" value="8" aria-label="并句最低单词数">-<input class="merge-max-words" type="number" min="1" max="200" step="1" value="20" aria-label="并句最多单词数"></label>
         <label>速度 <select class="play-speed">{''.join(f'<option value="{s}" {"selected" if s == 1 else ""}>{s}×</option>' for s in (0.5, 0.75, 1, 1.25, 1.5, 2))}</select></label>
       </div></details><div class="play-status" aria-live="polite"></div>
-      <div class="sentence-toolbar"><span>字幕</span><div class="sentence-actions"><button type="button" class="next-sentence" title="跳转到下一句" {'disabled' if not segments else ''}>下一句</button><button type="button" class="sentence-expand" aria-expanded="false">展开全部</button></div></div>
+      <div class="sentence-toolbar"><span>字幕</span><div class="sentence-actions"><button type="button" class="playback-toggle" aria-label="启动" title="读取当前设置并启动播放">启动</button><button type="button" class="next-sentence" title="跳转到下一句" {'disabled' if not segments else ''}>下一句</button><button type="button" class="tornado-mode" aria-pressed="false" title="锁定当前句或组无限循环" {'disabled' if not segments else ''}>龙卷风</button><button type="button" class="sentence-expand" aria-expanded="false">展开全部</button></div></div>
       <div class="sentence-list">{buttons or '<p>暂无字幕，仍可正常播放。字幕生成完成后将自动载入逐句学习。</p>'}</div>
     </section>'''
 
@@ -237,14 +239,14 @@ def remove_note(video_id, note_id, revision, editing_id):
         return "笔记已不存在", revision, gr.update(visible=False), None, gr.update(), gr.update()
 
 
-def remove_video(video_id, page, selected_id, page_size=PAGE_SIZE):
+def remove_video(video_id, selected_id):
     if not video_id:
-        return "请先选择视频", *library(page, page_size), gr.update(visible=False), None, selected_id
+        return "请先选择视频", *library(), gr.update(visible=False), None, selected_id
     try:
         store.delete_video(video_id)
-        return "视频和关联记录已删除", *library(page, page_size), gr.update(visible=False), None, None if selected_id == video_id else selected_id
+        return "视频和关联记录已删除", *library(), gr.update(visible=False), None, None if selected_id == video_id else selected_id
     except (OSError, ValueError) as error:
-        return message(error), *library(page, page_size), gr.update(visible=False), None, selected_id
+        return message(error), *library(), gr.update(visible=False), None, selected_id
 
 
 def submit_subtitle(video_id):
@@ -317,6 +319,73 @@ def ask(video_id, sentence_index, template, question):
         return history, message(error), question
 
 
+def remember_target(target):
+    if target in TARGETS:
+        store.set_setting('learning_target', target)
+
+
+def start_vocabulary(video_id, target):
+    try:
+        remember_target(target)
+        result = vocabulary_service.start(video_id, target)
+        return result if not result.startswith("已开始") else "任务已提交，进度与结果见下方词汇区"
+    except (RuntimeError, ValueError) as error:
+        return message(error)
+
+
+def vocabulary_view(video_id, target):
+    segments = store.get_segments(video_id) if video_id else []
+    digest = fingerprint(segments)
+    row = store.vocabulary(video_id, target) if video_id else None
+    items = []
+    if not video_id:
+        status = "请先选择视频"
+    elif not segments:
+        status = "请先生成字幕，再整理词汇"
+    elif not row:
+        status = "尚未整理此学习目标的词汇"
+    elif row['fingerprint'] != digest:
+        status = "字幕已更新，请重新整理词汇"
+    else:
+        status = row['detail']
+        if row['state'] == 'ready':
+            items = row['items']
+            if not items:
+                status = "本视频没有筛选出适合该目标的词汇，可更换学习目标"
+    cards = ''.join(
+        f'<button type="button" class="vocab-item" data-vocab-start="{item["start"]}" data-vocab-end="{item["end"]}" '
+        f'data-cue="{item["cue"]}"><strong>{html.escape(item["term"])}</strong><span>{html.escape(item["meaning"])}</span>'
+        f'<em>{html.escape(item["example"])}</em><span>{html.escape(item["translation"])}</span></button>' for item in items)
+    data = html.escape(json.dumps(segments, ensure_ascii=False), quote=True)
+    content = (f'<section id="vocabulary-panel" data-owner="{video_id}" data-source="{data}">'
+               f'<div class="vocab-heading">{html.escape(target or "")} · 词汇学习</div><p>{html.escape(status)}</p>'
+               f'<div class="vocab-list" aria-label="词汇列表">{cards}</div></section>')
+    return content, fingerprint([{'content': content}])
+
+
+def vocabulary_ui(video_id, target):
+    content, signature = vocabulary_view(video_id, target)
+    segments = store.get_segments(video_id) if video_id else []
+    row = store.vocabulary(video_id, target) if video_id else None
+    valid = bool(row and row['fingerprint'] == fingerprint(segments))
+    running = bool(valid and row['state'] == 'running')
+    ready = bool(valid and row['state'] == 'ready' and row['items'])
+    button = gr.update(visible=not ready, interactive=bool(segments) and not running,
+                       value="整理中…" if running else "整理词汇")
+    feed = content.replace('id="vocabulary-panel"', 'id="vocabulary-feed"', 1)
+    return content, signature, button, feed
+
+
+def request_vocabulary(video_id, target):
+    status = start_vocabulary(video_id, target)
+    return *vocabulary_ui(video_id, target), status
+
+
+def poll_vocabulary(video_id, target, signature):
+    result = vocabulary_ui(video_id, target)
+    return (gr.update(), gr.update(), result[2], gr.update()) if result[1] == signature else result
+
+
 CSS = """
 .gradio-container {width:100% !important; max-width:1280px !important; margin:auto; padding:0 28px 48px !important; font-family:system-ui,-apple-system,sans-serif; --body-background-fill:#0e1517; --background-fill-primary:#111b1e; --background-fill-secondary:#172428; --block-background-fill:#172428; --input-background-fill:#172428; --body-text-color:#e8f2ef; --body-text-color-subdued:#a3b6b5; --border-color-primary:#304348; --button-secondary-background-fill:#203136; --button-secondary-text-color:#e8f2ef; --button-primary-background-fill:#128d82; --button-primary-text-color:#f5fffc;}
 body,gradio-app,.gradio-container,.gradio-container .main {background:#0e1517 !important; color:#e8f2ef !important;}
@@ -343,25 +412,35 @@ body,gradio-app,.gradio-container,.gradio-container .main {background:#0e1517 !i
 .job-progress span {height:100%; display:block; background:#54d9c4;}
 .job-detail {margin:8px 0 0; font-size:12px; color:#ff9a7c; overflow-wrap:anywhere;}
 .jobs-empty {padding:24px 0; color:#a3b6b5; font-size:14px;}
+.current-video {border-left:3px solid #67dac4; padding-left:8px;}
+#vocabulary-feed {display:none !important;}
+#vocabulary-panel {border:1px solid #304348; border-radius:8px; padding:14px; margin-bottom:16px; background:#132124;}
+#vocabulary-panel p {font-size:12px; color:#a3b6b5; margin:5px 0;}
+.vocab-heading {font-size:13px; color:#67dac4; font-weight:650;}
+.vocab-list {max-height:360px; overflow:auto;}
+.vocab-current[hidden] {display:none;}
+.vocab-current {position:absolute; z-index:2; top:12px; left:12px; right:12px; max-height:45%; overflow:auto; pointer-events:none; scrollbar-width:none;}
+.vocab-item,.vocab-card {text-align:left; display:flex; flex-direction:column; gap:5px; padding:12px; margin:6px 0; width:100%; background:#1a3033; border:1px solid #304348; border-radius:6px; color:#d8e7e3; overflow-wrap:anywhere;}
+.video-frame .vocab-card {box-sizing:border-box; margin:0 0 6px; padding:8px 12px; background:rgba(10,22,25,.82); border-color:rgba(139,231,210,.3); font-size:clamp(11px,1.5vw,14px); line-height:1.4;}
+.video-frame .vocab-card strong {font-size:clamp(14px,1.8vw,18px);}
+.vocab-item {cursor:pointer;}
+.vocab-item.active {border-color:#67dac4;}
+.vocab-item strong,.vocab-card strong {color:#8be7d2; font-size:18px;}
+.vocab-item em,.vocab-card em {font-style:normal; color:#f1ce95;}
+.vocab-item:focus-visible {outline:2px solid #67dac4;}
 .video-list-row {align-items:center; border-bottom:1px solid #304348; gap:6px !important; padding:7px 0; min-height:58px;}
 .video-list-row .video-open,.video-list-row .video-meta {text-align:left; justify-content:flex-start; background:transparent !important; border:0 !important; box-shadow:none !important;}
 .video-list-row .video-open {font-weight:600; color:#e8f2ef; white-space:normal; overflow-wrap:anywhere;}
 .video-list-row .video-open:hover {color:#54d9c4;}
 .video-list-row .video-meta {color:#a3b6b5; font-size:12px;}
-.video-list-row .video-delete {max-width:48px; min-width:48px !important; background:transparent !important; border:0 !important; box-shadow:none !important; color:#ff9a7c !important; font-size:12px;}
+.video-list-row .video-delete {white-space:nowrap; padding:4px !important; max-width:48px; min-width:48px !important; background:transparent !important; border:0 !important; box-shadow:none !important; color:#ff9a7c !important; font-size:12px;}
 .note-list-row {align-items:center; border-bottom:1px solid #304348; gap:6px !important; padding:5px 0;}
 .note-list-row .note-time {flex:0 0 55px !important; width:55px !important; min-width:55px !important; color:#a3b6b5; font-size:12px; font-variant-numeric:tabular-nums;}
 .note-list-row .note-time p {margin:0; white-space:nowrap;}
 .note-list-row .note-open {min-width:0 !important; text-align:left; justify-content:flex-start; white-space:normal; overflow-wrap:anywhere; background:transparent !important; border:0 !important; box-shadow:none !important; color:#e8f2ef !important;}
 .note-list-row .note-delete {flex:0 0 48px !important; width:48px !important; min-width:48px !important; max-width:48px; white-space:nowrap; background:transparent !important; border:0 !important; box-shadow:none !important; color:#ff9a7c !important; font-size:12px;}
-.page-nav .form {width:86px !important; min-width:86px !important; flex:0 0 86px !important; overflow:visible !important; background:transparent !important; border:0 !important;}
-.library-size {width:82px !important; max-width:82px; min-width:82px !important; flex:0 0 82px !important; margin:0; padding:3px !important;}
-.page-nav {justify-content:flex-end; align-items:center; flex-wrap:nowrap !important; gap:10px !important; margin-top:18px;}
-.page-nav button {max-width:76px; min-width:70px !important; background:#203136 !important; color:#e8f2ef !important; border:1px solid #375057 !important;}
-.page-nav .page-count {width:fit-content !important; max-width:max-content !important; flex:0 0 auto !important; min-width:0; margin-left:0 !important; padding:0 !important; border:0 !important; background:transparent !important;}
-.page-nav p {text-align:right; margin:0; color:#a3b6b5; font-size:13px; white-space:nowrap;}
 .detail-heading h3 {font-size:20px; margin:0 0 3px; color:#e8f2ef;}
-.video-frame {background:#11191a; aspect-ratio:16/9; max-height:70vh; display:flex; justify-content:center;}
+.video-frame {position:relative; background:#11191a; aspect-ratio:16/9; max-height:70vh; display:flex; justify-content:center;}
 .video-frame video {width:100%; height:100%;}
 .player-settings {border-bottom:1px solid #304348;}
 .player-settings summary {display:flex; align-items:center; justify-content:space-between; padding:12px 0; cursor:pointer; color:#c5d7d4; font-size:13px; font-weight:650; list-style:none;}
@@ -369,14 +448,16 @@ body,gradio-app,.gradio-container,.gradio-container .main {background:#0e1517 !i
 .player-settings summary:focus-visible {outline:2px solid #54d9c4; outline-offset:3px; border-radius:4px;}
 .settings-toggle-hint::after {content:'展开 ▾'; color:#54d9c4; font-size:12px;}
 .player-settings[open] .settings-toggle-hint::after {content:'收起 ▴';}
-.sentence-actions {display:flex; align-items:center; gap:14px;}
+.sentence-actions {display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px;}
 .study-controls {display:flex; align-items:center; flex-wrap:wrap; gap:10px 22px; padding:0 0 13px;}
 .study-controls label {display:flex; align-items:center; gap:7px; font-size:13px; white-space:nowrap; color:#c5d7d4;}
 .study-controls input[type=number] {width:55px; border:1px solid #3b555a; padding:4px; border-radius:4px; color:#e8f2ef; background:#172428;}
 .study-controls select {border:1px solid #3b555a; padding:4px; border-radius:4px; color:#e8f2ef; background:#172428;}
-.sentence-actions .next-sentence {min-height:30px; padding:4px 12px; border:1px solid #3b7772; border-radius:4px; color:#89e5d6; background:#193634; font-size:13px; font-weight:600; white-space:nowrap; cursor:pointer;}
-.sentence-actions .next-sentence:hover:not(:disabled) {background:#245049;}
-.sentence-actions .next-sentence:disabled {opacity:.45; cursor:not-allowed;}
+.sentence-actions .next-sentence, .sentence-actions .playback-toggle, .sentence-actions .tornado-mode {min-height:30px; padding:4px 12px; border:1px solid #3b7772; border-radius:4px; color:#89e5d6; background:#193634; font-size:13px; font-weight:600; white-space:nowrap; cursor:pointer;}
+.sentence-actions .next-sentence:hover:not(:disabled), .sentence-actions .playback-toggle:hover {background:#245049;}
+.sentence-actions .tornado-mode.is-active {background:#67dac4; color:#102925; border-color:#67dac4; box-shadow:0 0 0 2px #67dac433;}
+.sentence-actions .tornado-mode:focus-visible {outline:2px solid #a2f4e2; outline-offset:2px;}
+.sentence-actions .next-sentence:disabled, .sentence-actions .tornado-mode:disabled {opacity:.45; cursor:not-allowed;}
 .play-status {padding:9px 0; color:#54d9c4; font-weight:600; font-size:13px;}
 .play-status:empty {display:none;}
 .sentence-list {max-height:180px; overflow:auto; border-top:1px solid #304348; margin-bottom:22px;}
@@ -390,7 +471,7 @@ body,gradio-app,.gradio-container,.gradio-container .main {background:#0e1517 !i
 .empty-detail {padding:60px 12px; color:#a3b6b5; text-align:center; border-top:1px solid #304348;}
 .study-secondary {border-top:1px solid #304348; padding-top:18px;}
 #auth-dialog,#delete-dialog,#note-delete-dialog {position:fixed !important; top:50%; left:50%; transform:translate(-50%,-50%); width:min(440px,calc(100vw - 28px)); max-height:80vh; overflow:auto; z-index:10000; padding:20px; border:1px solid #3b555a; border-radius:6px; background:#172428; box-shadow:0 0 0 100vmax rgba(0,0,0,.68),0 16px 48px rgba(0,0,0,.35);}
-@media(max-width:700px) {.gradio-container {padding:0 14px 30px !important;} .gradio-container main {padding:12px 14px !important;} .workspace-header {padding-top:18px;} .form-band {gap:12px !important;} .form-band .form-settings {max-width:none;} .video-frame {max-height:none;} .study-controls {gap:8px 14px;} .sentence-list {max-height:150px;} .video-list-row {flex-wrap:nowrap !important;} .video-list-row .video-meta {display:none;} .video-list-row .video-open {min-width:0 !important;} .page-nav {justify-content:center; gap:5px !important;} .page-nav button {min-width:48px !important; max-width:48px;} .page-nav p {font-size:12px;} .job-progress {width:27%;}}
+@media(max-width:700px) {.gradio-container {padding:0 14px 30px !important;} .gradio-container main {padding:12px 14px !important;} .workspace-header {padding-top:18px;} .form-band {gap:12px !important;} .form-band .form-settings {max-width:none;} .video-frame {max-height:none;} .study-controls {gap:8px 14px;} .sentence-list {max-height:150px;} .video-list-row {flex-wrap:nowrap !important;} .video-list-row .video-meta {display:none;} .video-list-row .video-open {min-width:0 !important;} .job-progress {width:27%;}}
 """
 
 
@@ -406,8 +487,6 @@ def build_app():
     with gr.Blocks(title="视频学习工作台", **({} if GRADIO_6 else assets)) as app:
         selected = gr.State(None)
         note_revision = gr.State(0)
-        page = gr.BrowserState(1, storage_key="video-study-page-v1", secret="video-study-local-preferences-v1")
-        page_size_state = gr.BrowserState(PAGE_SIZE, storage_key="video-study-page-size-v1", secret="video-study-local-preferences-v1")
         known_done = gr.State("")
         prompted_auth = gr.State(0)
         with gr.Column(visible=False, elem_id="note-delete-dialog") as note_delete_dialog:
@@ -435,28 +514,69 @@ def build_app():
                     upload = gr.File(label="视频文件", file_types=[".mp4", ".mkv", ".webm"], type="filepath", height=112)
                     upload_button = gr.Button("导入视频")
                     upload_status = gr.Markdown()
-            with gr.Tab("视频库"):
-                video_rows = []
-                for _ in range(MAX_PAGE_SIZE):
-                    with gr.Row(visible=False, elem_classes="video-list-row") as row_container:
-                        row_open = gr.Button("", elem_classes="video-open", size="sm", scale=5)
-                        row_meta = gr.Button("", elem_classes="video-meta", size="sm", scale=2)
-                        row_delete = gr.Button("删除", elem_classes="video-delete", size="sm", scale=0, min_width=48)
-                    row_id = gr.State(None)
-                    video_rows.append((row_container, row_open, row_meta, row_id, row_delete))
-                with gr.Row(elem_classes="page-nav"):
-                    previous = gr.Button("上一页", size="sm", scale=0, min_width=72)
-                    page_text = gr.Markdown(elem_classes="page-count")
-                    page_size = gr.Dropdown([10, 20, 40, 80], value=PAGE_SIZE, label="每页条数", show_label=False, elem_classes="library-size", scale=0, min_width=80)
-                    following = gr.Button("下一页", size="sm", scale=0, min_width=72)
+            with gr.Tab("视频库") as library_tab:
+                library_groups = gr.State([])
+
+                @gr.render(inputs=library_groups, queue=True, concurrency_limit=1, concurrency_id="library-render")
+                def render_library(groups):
+                    current_video = None
+                    def video_row(video):
+                        with gr.Row(elem_classes=["video-list-row", "current-video" if video["id"] == current_video else ""], key=f"video-row:{video['id']}"):
+                            opener = gr.Button(video['title'], elem_classes="video-open", scale=5, min_width=0, key=f"video-open:{video['id']}", preserved_by_key=[])
+                            subtitle_label = {'ready': '已就绪', 'none': '未生成', 'running': '生成中', 'failed': '失败'}.get(video['subtitle_state'], video['subtitle_state'])
+                            gr.Markdown(f"{video['duration']/60:.1f} 分钟 · 字幕{subtitle_label}", elem_classes="video-meta", key=f"video-meta:{video['id']}", preserved_by_key=[])
+                            delete = gr.Button("删除", elem_classes="video-delete", scale=0, min_width=48, key=f"video-delete:{video['id']}")
+                        opener.click(lambda vid=video['id']: choose_video(vid), outputs=[selected, tabs, *detail_outputs],
+                                     concurrency_id="video-selection", key=f"open-event:{video['id']}").then(lambda: (None, "", ""), outputs=[note_id, note_content, note_status], key=f"open-clear:{video['id']}")
+                        delete.click(lambda vid=video['id']: request_delete(vid), outputs=[delete_dialog, pending_delete, delete_text], key=f"delete-event:{video['id']}")
+                    if not groups:
+                        gr.Markdown("暂无视频，请先下载或导入")
+                    for group in groups:
+                        current_video = group['resume'] if any(v.get('watched_at') for v in group['videos']) else None
+                        if not group['series']:
+                            video_row(group['videos'][0])
+                            continue
+                        key = group['key']
+                        seasons = sorted({v['season'] for v in group['videos']})
+                        preferred = store.setting('season:' + key, str(seasons[0]))
+                        season_value = int(preferred) if preferred.isdigit() and int(preferred) in seasons else seasons[0]
+                        resume = next(v for v in group['videos'] if v['id'] == group['resume'])
+                        continue_button = gr.Button(continue_label(group['title'], resume), variant="primary", key=key+":continue", preserved_by_key=[])
+                        library_tab.select(lambda group_key=key, title=group['title']: refresh_continue(group_key, title), outputs=continue_button, key=key+":refresh-continue", show_progress="hidden")
+                        continue_button.click(lambda group_key=key: continue_series(group_key), outputs=[selected, tabs, *detail_outputs],
+                                              concurrency_id="video-selection", key=f"continue-event:{key}").then(lambda: (None, "", ""), outputs=[note_id, note_content, note_status], key=f"continue-clear:{key}")
+                        with gr.Accordion(f"{group['title']} · {len(group['videos'])} 集", open=store.setting('open:' + key) == '1',
+                                          key=key, preserved_by_key=['open']) as accordion:
+                            season_picker = gr.Dropdown([(f"第{n}季", n) for n in seasons], value=season_value, interactive=True, label="选择季", key=key+':season')
+                            season_columns = []
+                            for season in seasons:
+                                with gr.Column(visible=season == season_value, key=f"{key}:season-column:{season}") as column:
+                                    for video in group['videos']:
+                                        if video['season'] == season:
+                                            video_row(video)
+                                season_columns.append(column)
+                            def change_season(value, group_key=key, values=tuple(seasons)):
+                                store.set_setting('season:' + group_key, str(value))
+                                return [gr.update(visible=n == value) for n in values]
+                            season_picker.input(change_season, season_picker, season_columns, key=key+":season-event")
+                        accordion.expand(lambda group_key=key: store.set_setting('open:' + group_key, '1'), key=key+':expand')
+                        accordion.collapse(lambda group_key=key: store.set_setting('open:' + group_key, '0'), key=key+':collapse')
+                library_count = gr.Markdown()
                 library_status = gr.Markdown()
 
             with gr.Tab("学习详情", id="detail"):
                 heading = gr.Markdown("未选择视频", elem_classes="detail-heading")
+                vocabulary_feed = gr.HTML('<section id="vocabulary-feed"></section>')
                 player_html = gr.HTML(player(None))
                 subtitle_button = gr.Button("生成字幕", visible=False)
                 subtitle_status = gr.Markdown()
                 with gr.Tabs(elem_classes="study-secondary"):
+                    with gr.Tab("词汇", render_children=True):
+                        vocabulary_html = gr.HTML('<section id="vocabulary-panel">请选择有字幕的视频</section>')
+                        vocabulary_signature = gr.State("")
+                        learning_target = gr.Dropdown(TARGETS, value=lambda: store.setting('learning_target', '四级'), label="学习目标")
+                        vocabulary_button = gr.Button("整理词汇", variant="primary", interactive=False)
+                        vocabulary_status = gr.Markdown()
                     with gr.Tab("AI 对话"):
                         sentence = gr.Dropdown(show_label=False, choices=[], elem_id="ai-sentence")
                         template = gr.Dropdown(["自定义", *PROMPTS], show_label=False, label="提问模板")
@@ -489,6 +609,8 @@ def build_app():
                                 delete_note.click(request_note_delete, [selected, row_id],
                                                   [note_delete_dialog, pending_note_delete, note_delete_text])
 
+
+
         with gr.Column(visible=False, elem_id="auth-dialog") as auth_dialog:
             gr.Markdown("### 重新读取浏览器登录状态")
             auth_text = gr.Markdown()
@@ -507,29 +629,31 @@ def build_app():
         subtitle_timer = gr.Timer(3)
         sentence_timer = gr.Timer(1)
 
-        library_outputs = [page, page_text]
-        for row_container, row_open, row_meta, row_id, _ in video_rows:
-            library_outputs.extend((row_container, row_open, row_meta, row_id))
+        library_outputs = [library_count, library_groups]
         detail_outputs = [heading, player_html, chat, sentence, subtitle_button, subtitle_status]
 
-        app.load(initial_library, [page, page_size_state], [page_size, *library_outputs])
+        app.load(library, outputs=library_outputs)
         start.click(download, [url, manifest, allow_partial, browser, quality], [download_status, job_table])
         browser.change(store.set_preferred_browser, browser, outputs=None)
-        upload_button.click(upload_video, [upload, page_size], [upload_status, *library_outputs])
-        page_size.input(change_page_size, page_size, [page_size_state, *library_outputs])
-        previous.click(lambda p, size: library(max(1, p - 1), size), [page, page_size], library_outputs)
-        following.click(lambda p, size: library(p + 1, size), [page, page_size], library_outputs)
-        for _, row_open, row_meta, row_id, row_delete in video_rows:
-            for opener in (row_open, row_meta):
-                opener.click(choose_video, row_id, [selected, tabs, *detail_outputs],
-                             concurrency_id="video-selection").then(
-                    lambda: (None, "", ""), outputs=[note_id, note_content, note_status])
-            row_delete.click(request_delete, row_id, [delete_dialog, pending_delete, delete_text])
-        delete_confirm.click(remove_video, [pending_delete, page, selected, page_size], [library_status, *library_outputs, delete_dialog, pending_delete, selected]).then(detail, selected, detail_outputs)
+        upload_button.click(upload_video, upload, [upload_status, *library_outputs])
+        library_tab.select(refresh_library, library_groups, library_outputs, show_progress="hidden")
+        vocabulary_timer = gr.Timer(2)
+        position_timer = gr.Timer(5)
+        vocabulary_outputs = [vocabulary_html, vocabulary_signature, vocabulary_button, vocabulary_feed]
+        vocabulary_button.click(request_vocabulary, [selected, learning_target], [*vocabulary_outputs, vocabulary_status])
+        learning_target.change(remember_target, learning_target)
+        for event in (selected.change, learning_target.change):
+            event(lambda vid, goal: (*vocabulary_ui(vid, goal), ""), [selected, learning_target], [*vocabulary_outputs, vocabulary_status])
+        vocabulary_timer.tick(poll_vocabulary, [selected, learning_target, vocabulary_signature],
+                              vocabulary_outputs, queue=False, show_progress="hidden")
+        position_timer.tick(store.save_position, [selected, gr.Number(value=0, visible=False)], outputs=None,
+                            js="(id, time) => {const p=document.querySelector('#study-player'); const v=p?.querySelector('video'); return [p ? Number(p.dataset.videoId) : null,v?.currentTime ?? 0]}",
+                            queue=False, show_progress="hidden")
+        delete_confirm.click(remove_video, [pending_delete, selected], [library_status, *library_outputs, delete_dialog, pending_delete, selected]).then(detail, selected, detail_outputs)
         delete_cancel.click(lambda: (gr.update(visible=False), None), outputs=[delete_dialog, pending_delete])
         auth_retry.click(retry_download, [prompted_auth, url, manifest, allow_partial, retry_browser, quality], [download_status, job_table, auth_dialog, browser])
         auth_cancel.click(lambda: gr.update(visible=False), outputs=auth_dialog)
-        timer.tick(monitor, [page, known_done, prompted_auth, page_size], [job_table, *library_outputs, known_done, prompted_auth, auth_dialog, auth_text, retry_browser], queue=False)
+        timer.tick(monitor, [known_done, prompted_auth], [job_table, *library_outputs, known_done, prompted_auth, auth_dialog, auth_text, retry_browser], queue=False)
         subtitle_button.click(submit_subtitle, selected, [subtitle_status, subtitle_button])
         subtitle_timer.tick(poll_subtitle, selected, detail_outputs, queue=False)
         sentence_timer.tick(fn=None, inputs=sentence, outputs=sentence, queue=False, show_progress="hidden",
