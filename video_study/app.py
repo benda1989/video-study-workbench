@@ -145,7 +145,8 @@ def retry_download(job_id, url, manifest, allow_partial, browser, quality):
 
 
 def choose_video(video_id):
-    return (video_id if store.get_video(video_id) else None), gr.update(selected="detail")
+    target = video_id if store.get_video(video_id) else None
+    return target, gr.update(selected="detail"), *detail(target)
 
 
 def request_delete(video_id):
@@ -165,15 +166,19 @@ def player(video_id: int | None) -> str:
     buttons = "".join(f'<button type="button" data-seek="{i}" title="跳转到本句"><span>{i+1:02d}</span> {html.escape(s["text"])}</button>' for i, s in enumerate(segments))
     return f'''<section id="study-player" data-video-id="{video_id}" data-segments="{data}">
       <div class="video-frame"><video controls playsinline preload="metadata" src="{src}"></video></div>
+      <details class="player-settings" open>
+        <summary>播放设置<span class="settings-toggle-hint" aria-hidden="true"></span></summary>
       <div class="study-controls">
         <label><input type="checkbox" class="repeat-mode"> 逐句</label>
-        <label><input class="repeat-count" type="number" min="1" max="20" value="3"> 遍</label>
-        <label>遍停 <input class="pause-factor" type="number" min="0" max="10" step="0.5" value="0"> 倍句长</label>
-        <label>循停 <input class="end-pause-factor" type="number" min="0" max="10" step="0.5" value="0"> 倍句长</label>
+        <label>循环<input class="repeat-count" type="number" min="1" max="20" value="3"></label>
+        <label>遍停 <input class="pause-factor" type="number" min="0" max="10" step="0.5" value="0">X句</label>
+        <label>循停 <input class="end-pause-factor" type="number" min="0" max="10" step="0.5" value="0">X句</label>
+        <label title="独立说话人句子按词数跳过；无说话人时先跳词再并句；0为不跳过"><input type="checkbox" class="skip-mode" checked> 跳词 <input class="skip-words" type="number" min="0" step="1" value="0" aria-label="跳词数量"></label>
+        <label title="连续同说话人走并句；无说话人时先跳词再并句；保留1.5秒间隔与词数限制"><input type="checkbox" class="merge-mode"> 并句</label>
+        <label title="少于此词数才向后并句，累计达到后停止；不保证每组都能达到"><input class="merge-min-words" type="number" min="1" max="100" step="1" value="8" aria-label="并句最低单词数">-<input class="merge-max-words" type="number" min="1" max="200" step="1" value="20" aria-label="并句最多单词数"></label>
         <label>速度 <select class="play-speed">{''.join(f'<option value="{s}" {"selected" if s == 1 else ""}>{s}×</option>' for s in (0.5, 0.75, 1, 1.25, 1.5, 2))}</select></label>
-        <button type="button" class="next-sentence" title="跳转到下一句" {'disabled' if not segments else ''}>下一句</button>
-      </div><div class="play-status" aria-live="polite"></div>
-      <div class="sentence-toolbar"><span>字幕</span><button type="button" class="sentence-expand" aria-expanded="false">展开全部</button></div>
+      </div></details><div class="play-status" aria-live="polite"></div>
+      <div class="sentence-toolbar"><span>字幕</span><div class="sentence-actions"><button type="button" class="next-sentence" title="跳转到下一句" {'disabled' if not segments else ''}>下一句</button><button type="button" class="sentence-expand" aria-expanded="false">展开全部</button></div></div>
       <div class="sentence-list">{buttons or '<p>暂无字幕，仍可正常播放。字幕生成完成后将自动载入逐句学习。</p>'}</div>
     </section>'''
 
@@ -183,13 +188,13 @@ def detail(video_id):
     if not video:
         return "未选择视频", player(None), [], gr.update(choices=[], value=None), gr.update(visible=False), ""
     segments = store.get_segments(video_id)
-    sentence_choices = [(f"{i + 1}. {s['text'][:75]}", i) for i, s in enumerate(segments)]
+    sentence_choices = [(f"{i + 1}. {s['text'][:75]}", f"{video_id}:{i}") for i, s in enumerate(segments)]
     state = video["subtitle_state"]
     status = ("字幕正在生成，完成后自动载入…" if state == "running" else
               f"字幕生成失败：{video['subtitle_error']}" if state == "failed" else
               "")
     return (f"### {video['title']}", player(video_id),
-            store.list_chat(video_id), gr.update(choices=sentence_choices, value=0 if sentence_choices else None),
+            store.list_chat(video_id), gr.update(choices=sentence_choices, value=f"{video_id}:0" if sentence_choices else None),
             gr.update(visible=not segments and state != "running"), status)
 
 
@@ -291,8 +296,17 @@ def ask(video_id, sentence_index, template, question):
     if not video:
         return [], "请先选择视频", question
     segments = store.get_segments(video_id)
-    sentence = segments[int(sentence_index)]["text"] if sentence_index is not None and 0 <= int(sentence_index) < len(segments) else ""
     history = store.list_chat(video_id)
+    sentence = ""
+    if sentence_index is not None and sentence_index != "":
+        try:
+            owner, raw_index = sentence_index.split(":", 1)
+            index = int(raw_index)
+            if owner != str(video_id) or not 0 <= index < len(segments):
+                raise ValueError("stale sentence")
+            sentence = segments[index]["text"]
+        except (AttributeError, TypeError, ValueError):
+            return history, "字幕选择已失效，请在当前视频重新选择后提问", question
     try:
         answer = ai.ask(video["title"], sentence, question or "", template or "", history)
         prompt = f"[{template}] {sentence}\n{question or ''}".strip()
@@ -349,13 +363,20 @@ body,gradio-app,.gradio-container,.gradio-container .main {background:#0e1517 !i
 .detail-heading h3 {font-size:20px; margin:0 0 3px; color:#e8f2ef;}
 .video-frame {background:#11191a; aspect-ratio:16/9; max-height:70vh; display:flex; justify-content:center;}
 .video-frame video {width:100%; height:100%;}
-.study-controls {display:flex; align-items:center; flex-wrap:wrap; gap:10px 22px; padding:13px 0; border-bottom:1px solid #304348;}
+.player-settings {border-bottom:1px solid #304348;}
+.player-settings summary {display:flex; align-items:center; justify-content:space-between; padding:12px 0; cursor:pointer; color:#c5d7d4; font-size:13px; font-weight:650; list-style:none;}
+.player-settings summary::-webkit-details-marker {display:none;}
+.player-settings summary:focus-visible {outline:2px solid #54d9c4; outline-offset:3px; border-radius:4px;}
+.settings-toggle-hint::after {content:'展开 ▾'; color:#54d9c4; font-size:12px;}
+.player-settings[open] .settings-toggle-hint::after {content:'收起 ▴';}
+.sentence-actions {display:flex; align-items:center; gap:14px;}
+.study-controls {display:flex; align-items:center; flex-wrap:wrap; gap:10px 22px; padding:0 0 13px;}
 .study-controls label {display:flex; align-items:center; gap:7px; font-size:13px; white-space:nowrap; color:#c5d7d4;}
 .study-controls input[type=number] {width:55px; border:1px solid #3b555a; padding:4px; border-radius:4px; color:#e8f2ef; background:#172428;}
 .study-controls select {border:1px solid #3b555a; padding:4px; border-radius:4px; color:#e8f2ef; background:#172428;}
-.study-controls .next-sentence {min-height:30px; padding:4px 12px; border:1px solid #3b7772; border-radius:4px; color:#89e5d6; background:#193634; font-size:13px; font-weight:600; white-space:nowrap; cursor:pointer;}
-.study-controls .next-sentence:hover:not(:disabled) {background:#245049;}
-.study-controls .next-sentence:disabled {opacity:.45; cursor:not-allowed;}
+.sentence-actions .next-sentence {min-height:30px; padding:4px 12px; border:1px solid #3b7772; border-radius:4px; color:#89e5d6; background:#193634; font-size:13px; font-weight:600; white-space:nowrap; cursor:pointer;}
+.sentence-actions .next-sentence:hover:not(:disabled) {background:#245049;}
+.sentence-actions .next-sentence:disabled {opacity:.45; cursor:not-allowed;}
 .play-status {padding:9px 0; color:#54d9c4; font-weight:600; font-size:13px;}
 .play-status:empty {display:none;}
 .sentence-list {max-height:180px; overflow:auto; border-top:1px solid #304348; margin-bottom:22px;}
@@ -437,7 +458,7 @@ def build_app():
                 subtitle_status = gr.Markdown()
                 with gr.Tabs(elem_classes="study-secondary"):
                     with gr.Tab("AI 对话"):
-                        sentence = gr.Dropdown(show_label=False, choices=[])
+                        sentence = gr.Dropdown(show_label=False, choices=[], elem_id="ai-sentence")
                         template = gr.Dropdown(["自定义", *PROMPTS], show_label=False, label="提问模板")
                         question = gr.Textbox(label="补充", lines=2)
                         ask_button = gr.Button("提问", variant="primary")
@@ -500,7 +521,8 @@ def build_app():
         following.click(lambda p, size: library(p + 1, size), [page, page_size], library_outputs)
         for _, row_open, row_meta, row_id, row_delete in video_rows:
             for opener in (row_open, row_meta):
-                opener.click(choose_video, row_id, [selected, tabs]).then(detail, selected, detail_outputs).then(
+                opener.click(choose_video, row_id, [selected, tabs, *detail_outputs],
+                             concurrency_id="video-selection").then(
                     lambda: (None, "", ""), outputs=[note_id, note_content, note_status])
             row_delete.click(request_delete, row_id, [delete_dialog, pending_delete, delete_text])
         delete_confirm.click(remove_video, [pending_delete, page, selected, page_size], [library_status, *library_outputs, delete_dialog, pending_delete, selected]).then(detail, selected, detail_outputs)
@@ -510,9 +532,12 @@ def build_app():
         timer.tick(monitor, [page, known_done, prompted_auth, page_size], [job_table, *library_outputs, known_done, prompted_auth, auth_dialog, auth_text, retry_browser], queue=False)
         subtitle_button.click(submit_subtitle, selected, [subtitle_status, subtitle_button])
         subtitle_timer.tick(poll_subtitle, selected, detail_outputs, queue=False)
-        sentence_timer.tick(fn=lambda current: current, inputs=sentence, outputs=sentence, queue=False, show_progress="hidden",
-                            js="(current) => { const root = document.querySelector('#study-player'); if (!root) return current; const video = root.querySelector('video'); const segments = JSON.parse(root.dataset.segments || '[]'); if (!video || !segments.length) return current; const index = segments.findIndex(s => video.currentTime < s.end - 0.04); return index < 0 ? segments.length - 1 : index; }")
-        ask_button.click(ask, [selected, sentence, template, question], [chat, chat_status, question])
+        sentence_timer.tick(fn=None, inputs=sentence, outputs=sentence, queue=False, show_progress="hidden",
+                            js=Path(__file__).with_name("sentence_sync.js").read_text(encoding="utf-8"))
+        # ask() validates the video owner and range against current persisted subtitles.
+        # Gradio's dynamic choices may lag behind the browser during a switch.
+        ask_button.click(ask, [selected, sentence, template, question],
+                         [chat, chat_status, question], preprocess=False)
         save_button.click(save_note, [selected, note_id, note_content, note_time, note_revision], [note_status, note_revision, note_id, note_content],
                           js="(videoId,noteId,content,time,revision) => [videoId,noteId,content,document.querySelector('#study-player video')?.currentTime ?? 0,revision]")
         note_delete_confirm.click(remove_note, [selected, pending_note_delete, note_revision, note_id],
